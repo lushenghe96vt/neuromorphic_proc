@@ -350,6 +350,10 @@ teams/teamN_<block>/
 
 The repository also provides [`shared/`](shared/) for common RTL, testbench components, custom cells, and technology assets, and [`integration/`](integration/) for the top-level RTL, full-system testbench, implementation scripts, and final reports. Keep team-specific work in the team workspace; promote reusable or released assets to the shared or integration areas through review.
 
+### Independent accelerator workspace
+
+The repository also includes [`cordic_polar_tx/`](cordic_polar_tx/), an independent CORDIC block for a Polar TX datapath. It accepts signed 16-bit `I` and `Q` samples and produces 16-bit amplitude (`A`) and phase (`P`) outputs. Its workspace follows the same RTL, testbench, documentation, constraints, scripts, and reports structure as the team assignments.
+
 ## Verification Definition of Done
 
 A block is ready for integration when:
