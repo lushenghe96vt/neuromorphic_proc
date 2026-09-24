@@ -11,6 +11,8 @@ module block2_digital_snn (
     output logic       AER_OUT_REQ,
     output logic [7:0] AER_OUT_ADDR
 );
+    //sheng_branch
+
     // TODO: Implement the Team 2 microarchitecture.
 
     // each voltage is signed 12-bit Q4.8. ???
