@@ -1,21 +1,86 @@
 `timescale 1ns/1ps
 
+// ----------------------------------------------------------------------------
+// Team 2 contains 32 LOGICAL neurons but only one physical LIF arithmetic
+// datapath.  The 32 neurons are organized as two layers of 16 channels:
+//
+//   neuron_id = 0_ssss  -> hidden neuron  s   (indices  0..15)
+//   neuron_id = 1_ssss  -> output neuron  s   (indices 16..31)
+//
+// where s = AER_IN_ADDR[3:0].
+//
+// Per accepted AER input event on channel s:
+//   1. Update hidden neuron s using WEIGHT_IN[s].
+//   2. If hidden neuron s does NOT spike, the event is finished.
+//   3. If hidden neuron s DOES spike, reuse the same physical LIF datapath to
+//      update output neuron 16+s using the SAME WEIGHT_IN[s].
+//   4. The hidden-layer spike is internal only; it does NOT generate AER.
+//   5. If output neuron 16+s spikes, emit AER_OUT_ADDR = {4'b0010, s}.
+//
+// This is the intended meaning of time multiplexing here: the hidden and output
+// logical neurons take turns using one datapath.  We never instantiate 32 LIF
+// arithmetic units and we do not sweep all 32 neurons on each input event.
+//
+// LIF model
+// ---------
+// One mathematical LIF update is spread across multiple CLK cycles:
+//
+//   V_leak      = V_RESET + beta * (V_old - V_RESET)
+//   V_candidate = V_leak + W_scaled
+//
+//   if V_candidate >= V_THRESHOLD:
+//       spike  = 1
+//       V_next = V_RESET
+//   else:
+//       spike  = 0
+//       V_next = saturate_Q4.8(V_candidate)
+//
+// Default reference values:
+//   beta        = 0.875 = 224/256 = 8'hE0 (unsigned Q0.8)
+//   threshold   = 1.0   = 256/256          (signed Q4.8)
+//   reset       = 0.0                         (signed Q4.8)
+//
+// WEIGHT INTERFACE
+// ----------------
+// Team 3 supplies sixteen signed 8-bit weights packed as WEIGHT_IN[127:0]:
+//
+//   channel s weight = WEIGHT_IN[8*s +: 8]
+//
+// The same captured channel weight is used for BOTH the hidden and output pass.
+// The project currently specifies the weight width but not its binary point.
+// Until that numerical convention is finalized, this RTL interprets each
+// signed 8-bit weight as Q0.7.  Q0.7 -> Q4.8 is a one-bit left shift.
+//
+// STDP INTERFACE ASSUMPTION
+// -------------------------
+// STDP_PRE_SPIKE[s] pulses for one CLK when an external AER event on channel s
+// is accepted.  STDP_POST_SPIKE[s] pulses for one CLK when output neuron 16+s
+// fires.  This treats the externally observed source/output pair as the pre/post
+// events supplied to Team 3.  If the integration contract defines different
+// pulse semantics, only these pulse-generation points need to change.
+//
+// LEAK POLICY
+// -----------
+// This implementation uses event-driven leak only: a neuron is leaked when it
+// is actually passed through the shared datapath.  Neurons that receive no
+// events are not background-updated.  A lazy-leak or idle background sweep can
+// be added later without changing the two-layer neuron mapping below.
+// ============================================================================
 module block2_digital_snn #(
-    parameter logic [7:0]         BETA_VALUE       = 8'hE0,     // 0.875 Q0.8
+    parameter logic [7:0]         BETA_VALUE       = 8'hE0,    // 0.875 Q0.8
     parameter logic signed [11:0] THRESHOLD_VALUE = 12'sd256,  // 1.0 Q4.8
-    parameter logic signed [11:0] RESET_VALUE     = 12'sd0,    // 0.0 Q4.8
-    parameter integer LEAK_SWEEP_PERIOD_CYCLES = 200           // 100 us @ 2 MHz
+    parameter logic signed [11:0] RESET_VALUE     = 12'sd0     // 0.0 Q4.8
 ) (
     input  logic         CLK,
     input  logic         RST_N,
     input  logic         SE,
     input  logic         SI,
 
-    // Input AER transaction.  Only the lower nibble selects Team 2 channel s.
+    // Input AER, upper nibble = tile id, lower nibble = neuron id.
     input  logic         AER_IN_REQ,
     input  logic [7:0]   AER_IN_ADDR,
 
-    // Sixteen signed 8-bit weights from Team 3.
+    // 16 signed 8-bit weights from Team 3.
     // Weight s occupies WEIGHT_IN[8*s +: 8].
     input  logic [127:0] WEIGHT_IN,
 
@@ -35,14 +100,14 @@ module block2_digital_snn #(
     // ------------------------------------------------------------------------
     // Logical neuron state storage
     // ------------------------------------------------------------------------
-    //  0..15 : hidden layer
-    // 16..31 : output layer
+    // 0 to 15: hidden layer
+    // 16 to 31: output layer
     // Each membrane voltage is signed 12-bit Q4.8.
     logic signed [11:0] V_M [0:31];
 
     // Internal logical-neuron selector.
-    //   bit 4   : 0 = hidden layer, 1 = output layer
-    //   bits3:0 : channel s
+    //   bit 4: 0 = hidden layer, 1 = output layer
+    //   bits3:0: channel s
     logic [4:0] neuron_id;
 
     // Captured channel identity from the accepted AER transaction.
@@ -68,33 +133,12 @@ module block2_digital_snn #(
     logic processing_output_layer;
 
     // ------------------------------------------------------------------------
-    // Periodic background leak sweep
-    // ------------------------------------------------------------------------
-    // This implementation uses a periodic background sweep.
-    // A sweep request is generated every LEAK_SWEEP_PERIOD_CYCLES clocks and, when
-    // the foreground datapath is idle, all 32 membrane states are decayed once
-    // using the SAME beta multiplier as normal event processing.
-    //
-    // Foreground AER traffic has priority. If an event arrives during a sweep,
-    // the current neuron's leak update is completed atomically, the sweep is
-    // paused between neurons, the event is processed, and the sweep resumes.
-    // This avoids simultaneous writes to one V_M entry and avoids adding a
-    // second arithmetic datapath.
-    localparam integer LEAK_TIMER_WIDTH =
-        (LEAK_SWEEP_PERIOD_CYCLES <= 1) ? 1 : $clog2(LEAK_SWEEP_PERIOD_CYCLES);
-
-    logic [LEAK_TIMER_WIDTH-1:0] leak_period_counter;
-    logic                        leak_sweep_due;
-    logic                        leak_sweep_active;
-    logic [4:0]                  leak_index;
-
-    // ------------------------------------------------------------------------
     // Controller states
     // ------------------------------------------------------------------------
     // READ/APPLY_LEAK/ADD_WEIGHT/THRESHOLD/WRITE implement one mathematical
     // neuron update.  If a hidden neuron spikes, WRITE_NEURON changes the
     // selected logical neuron from 0_ssss to 1_ssss and runs those same states
-    // again using the same physical arithmetic hardware.
+    // using the same physical arithmetic hardware.
     typedef enum logic [3:0] {
         IDLE,
         WAIT_INPUT_REQ_LOW,
@@ -104,10 +148,7 @@ module block2_digital_snn #(
         THRESHOLD_CHECK,
         WRITE_NEURON,
         SEND_SPIKE,
-        WAIT_OUTPUT_ACK_LOW,
-        LEAK_READ,
-        LEAK_APPLY,
-        LEAK_WRITE
+        WAIT_OUTPUT_ACK_LOW
     } state_t;
 
     state_t state;
@@ -136,10 +177,6 @@ module block2_digital_snn #(
             saved_next_voltage      <= RESET_VALUE;
             saved_spike             <= 1'b0;
             processing_output_layer <= 1'b0;
-            leak_period_counter      <= '0;
-            leak_sweep_due           <= 1'b0;
-            leak_sweep_active        <= 1'b0;
-            leak_index               <= 5'd0;
 
             AER_IN_ACK              <= 1'b0;
             AER_OUT_REQ             <= 1'b0;
@@ -168,35 +205,12 @@ module block2_digital_snn #(
             STDP_PRE_SPIKE  <= '0;
             STDP_POST_SPIKE <= '0;
 
-            // ------------------------------------------------------------
-            // Periodic leak scheduler.  This timer runs in normal mode even
-            // while foreground event processing is active.  When it expires
-            // it posts a one-bit pending request; multiple missed periods do
-            // not accumulate into multiple queued sweeps.  Scan mode pauses
-            // the scheduler because this block is outside this normal-mode
-            // branch.
-            // ------------------------------------------------------------
-            if (LEAK_SWEEP_PERIOD_CYCLES <= 1) begin
-                leak_period_counter <= '0;
-                leak_sweep_due      <= 1'b1;
-            end
-            else if (leak_period_counter == LEAK_SWEEP_PERIOD_CYCLES - 1) begin
-                leak_period_counter <= '0;
-                leak_sweep_due      <= 1'b1;
-            end
-            else begin
-                leak_period_counter <= leak_period_counter + 1'b1;
-            end
-
             case (state)
 
                 // ------------------------------------------------------------
                 // IDLE: accept one external event on source/channel s.
                 // ------------------------------------------------------------
                 IDLE: begin
-                    // Foreground AER traffic always has priority over leakage.
-                    // A paused sweep remains active and will resume after the
-                    // foreground event completes.
                     if (AER_IN_REQ) begin
                         source_id <= AER_IN_ADDR[3:0];
 
@@ -219,20 +233,6 @@ module block2_digital_snn #(
                         // raise ACK, then wait for the sender to lower REQ.
                         AER_IN_ACK <= 1'b1;
                         state      <= WAIT_INPUT_REQ_LOW;
-                    end
-                    else if (leak_sweep_active) begin
-                        // Resume a sweep that was paused between neurons by a
-                        // foreground AER transaction.
-                        state <= LEAK_READ;
-                    end
-                    else if (leak_sweep_due) begin
-                        // Start one full 32-neuron background decay sweep.
-                        // The pending request is consumed here; a later timer
-                        // expiration may post the next sweep while this one runs.
-                        leak_sweep_due   <= 1'b0;
-                        leak_sweep_active<= 1'b1;
-                        leak_index       <= 5'd0;
-                        state            <= LEAK_READ;
                     end
                 end
 
@@ -382,65 +382,6 @@ module block2_digital_snn #(
                 WAIT_OUTPUT_ACK_LOW: begin
                     if (!AER_OUT_ACK)
                         state <= IDLE;
-                end
-
-                // ------------------------------------------------------------
-                // LEAK_READ / LEAK_APPLY / LEAK_WRITE:
-                // Periodic background decay for neurons that have not received
-                // an event.  This path deliberately bypasses weight addition,
-                // threshold generation, STDP pulses, and AER output.  It only
-                // performs:
-                //   V <- V_RESET + beta * (V - V_RESET)
-                // using the shared beta multiplier already present in the LIF
-                // datapath.
-                // ------------------------------------------------------------
-                LEAK_READ: begin
-                    current_voltage <= V_M[leak_index];
-                    state           <= LEAK_APPLY;
-                end
-
-                LEAK_APPLY: begin
-                    beta_product <=
-                        ($signed({current_voltage[11], current_voltage}) -
-                         $signed({RESET_VALUE[11], RESET_VALUE})) *
-                        $signed({1'b0, BETA_VALUE});
-
-                    state <= LEAK_WRITE;
-                end
-
-                LEAK_WRITE: begin
-                    // Saturate the decayed value back into signed 12-bit Q4.8.
-                    // With the default RESET=0 and 0<=beta<1 the value normally
-                    // moves toward zero, but saturation keeps this robust for
-                    // other legal parameter choices.
-                    if (($signed({{10{RESET_VALUE[11]}}, RESET_VALUE}) +
-                         ($signed(beta_product) >>> 8)) > 22'sd2047)
-                        V_M[leak_index] <= 12'sd2047;
-                    else if (($signed({{10{RESET_VALUE[11]}}, RESET_VALUE}) +
-                              ($signed(beta_product) >>> 8)) < -22'sd2048)
-                        V_M[leak_index] <= -12'sd2048;
-                    else
-                        V_M[leak_index] <=
-                            ($signed({{10{RESET_VALUE[11]}}, RESET_VALUE}) +
-                             ($signed(beta_product) >>> 8));
-
-                    if (leak_index == 5'd31) begin
-                        // Full sweep complete.
-                        leak_sweep_active <= 1'b0;
-                        leak_index        <= 5'd0;
-                        state             <= IDLE;
-                    end
-                    else begin
-                        // Complete one neuron atomically, then either continue
-                        // immediately or yield to newly arrived foreground AER
-                        // traffic.  Keeping leak_sweep_active asserted preserves
-                        // the resume point across that event.
-                        leak_index <= leak_index + 1'b1;
-                        if (AER_IN_REQ)
-                            state <= IDLE;
-                        else
-                            state <= LEAK_READ;
-                    end
                 end
 
                 default: begin

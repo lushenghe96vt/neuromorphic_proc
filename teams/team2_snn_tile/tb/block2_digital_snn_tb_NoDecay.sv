@@ -14,10 +14,6 @@
 //   * output spikes generate AER_OUT_ADDR = {4'b0010, s}
 //   * STDP_PRE_SPIKE pulses on accepted input event
 //   * STDP_POST_SPIKE pulses when the output neuron fires
-//   * periodic background leak sweeps decay all 32 membrane states
-//   * background leakage produces no AER/STDP activity
-//   * foreground AER traffic preempts a sweep and the sweep resumes
-//   * reset cancels pending/in-progress sweep state
 //
 // Weight numerical convention remains the temporary RTL convention:
 // signed Q0.7.  Therefore raw +32 represents +0.25 membrane units.
@@ -43,13 +39,7 @@ module block2_digital_snn_tb;
     int tests_run;
     int tests_failed;
 
-    // Use a moderately short sweep interval so the leak tests complete quickly
-    // while the pre-existing functional tests still finish before the first sweep.
-    localparam int TB_LEAK_SWEEP_PERIOD_CYCLES = 1024;
-
-    block2_digital_snn #(
-        .LEAK_SWEEP_PERIOD_CYCLES(TB_LEAK_SWEEP_PERIOD_CYCLES)
-    ) dut (
+    block2_digital_snn dut (
         .CLK(CLK),
         .RST_N(RST_N),
         .SE(SE),
@@ -181,89 +171,6 @@ module block2_digital_snn_tb;
             AER_OUT_ACK = 1'b0;
             @(posedge CLK);
             #1;
-        end
-    endtask
-
-
-    // ------------------------------------------------------------------------
-    // Hold an input request until the DUT is actually ready to acknowledge it.
-    // This is useful for verifying that a background leak sweep does not lose
-    // foreground traffic: the request may arrive while the sweep owns the shared
-    // datapath, but it must eventually be accepted once the sweep yields.
-    // ------------------------------------------------------------------------
-    task automatic send_event_wait_for_ack(
-        input logic [3:0] source,
-        input string      tag,
-        input int         timeout_cycles
-    );
-        int waited;
-        begin
-            @(negedge CLK);
-            AER_IN_ADDR = {4'b0001, source};
-            AER_IN_REQ  = 1'b1;
-
-            waited = 0;
-            while ((AER_IN_ACK !== 1'b1) && (waited < timeout_cycles)) begin
-                @(posedge CLK);
-                #1;
-                waited++;
-            end
-
-            check(AER_IN_ACK === 1'b1,
-                  $sformatf("%s: request eventually acknowledged after background leak", tag));
-            check(STDP_PRE_SPIKE[source] === 1'b1,
-                  $sformatf("%s: accepted foreground event still produces PRE pulse", tag));
-
-            @(negedge CLK);
-            AER_IN_REQ = 1'b0;
-            @(posedge CLK);
-            #1;
-            check(AER_IN_ACK === 1'b0,
-                  $sformatf("%s: input ACK returned low after deferred acceptance", tag));
-        end
-    endtask
-
-    // Wait for a particular membrane value with a timeout.  This avoids tying
-    // the testbench to the exact internal leak-state encoding while still
-    // proving that a scheduled background write eventually occurs.
-    task automatic wait_for_membrane_value(
-        input int                 neuron,
-        input logic signed [11:0] expected,
-        input int                 timeout_cycles,
-        input string              tag
-    );
-        int waited;
-        begin
-            waited = 0;
-            while ((dut.V_M[neuron] !== expected) && (waited < timeout_cycles)) begin
-                @(posedge CLK);
-                #1;
-                waited++;
-            end
-            check(dut.V_M[neuron] === expected,
-                  $sformatf("%s: neuron %0d reached expected raw value %0d",
-                            tag, neuron, $signed(expected)));
-        end
-    endtask
-
-    // During a pure background leak interval there must be no AER transmission
-    // and no STDP activity.  Background decay changes only membrane state.
-    task automatic monitor_quiet_background(
-        input int    cycles,
-        input string tag
-    );
-        int k;
-        begin
-            for (k = 0; k < cycles; k++) begin
-                @(posedge CLK);
-                #1;
-                check(AER_OUT_REQ === 1'b0,
-                      $sformatf("%s: no AER output during background leak (cycle %0d)", tag, k));
-                check(STDP_PRE_SPIKE === 16'h0000,
-                      $sformatf("%s: no PRE pulse during background leak (cycle %0d)", tag, k));
-                check(STDP_POST_SPIKE === 16'h0000,
-                      $sformatf("%s: no POST pulse during background leak (cycle %0d)", tag, k));
-            end
         end
     endtask
 
@@ -430,165 +337,6 @@ module block2_digital_snn_tb;
               "hidden 6 fired using captured positive weight");
         check(dut.V_M[22] === 12'sd64,
               "output 22 reused the same captured +0.25 weight");
-
-
-        // --------------------------------------------------------------------
-        // TEST 7: one complete periodic background sweep decays both hidden and
-        // output neurons using beta only.  No weight, AER, or STDP activity is
-        // allowed during the sweep.
-        //
-        // Preparation:
-        //   V_M[0]  = 64  (+0.25)
-        //   V_M[31] = 64  (+0.25), reached through a legal hidden-15 spike.
-        // Expected after one leak application with beta = 0.875:
-        //   64 * 224 / 256 = 56 raw = 0.21875
-        // --------------------------------------------------------------------
-        $display("\n--- TEST 7: PERIODIC BACKGROUND LEAK SWEEP ---");
-
-        // Reset also restarts the periodic sweep scheduler.
-        @(negedge CLK);
-        RST_N = 1'b0;
-        wait_clks(2);
-        @(negedge CLK);
-        RST_N = 1'b1;
-        @(posedge CLK);
-        #1;
-
-        set_weight(4'd0, 8'sd32);
-        send_event(4'd0, "LEAK-PREP-H0");
-        wait_hidden_only();
-        check(dut.V_M[0] === 12'sd64,
-              "leak test prepares hidden neuron 0 to raw 64");
-
-        set_weight(4'd15, 8'sd32);
-        drive_one_hidden_spike(4'd15, "LEAK-PREP-O31");
-        check(dut.V_M[31] === 12'sd64,
-              "leak test prepares output neuron 31 to raw 64");
-
-        // No foreground requests from here until the sweep has completed.
-        AER_IN_REQ  = 1'b0;
-        AER_OUT_ACK = 1'b0;
-
-        fork
-            begin
-                // The first sweep trigger occurs after TB_LEAK_SWEEP_PERIOD_CYCLES.
-                // Add margin for all 32 three-state leak updates.
-                monitor_quiet_background(TB_LEAK_SWEEP_PERIOD_CYCLES + 140,
-                                         "BACKGROUND-QUIET");
-            end
-            begin
-                wait_for_membrane_value(0, 12'sd56,
-                                        TB_LEAK_SWEEP_PERIOD_CYCLES + 40,
-                                        "BACKGROUND-LEAK-H0");
-                wait_for_membrane_value(31, 12'sd56,
-                                        140,
-                                        "BACKGROUND-LEAK-O31");
-            end
-        join
-
-        check(dut.V_M[0] === 12'sd56,
-              "background sweep applies exactly one beta decay to hidden neuron 0");
-        check(dut.V_M[31] === 12'sd56,
-              "background sweep reaches output neuron 31");
-
-        // --------------------------------------------------------------------
-        // TEST 8: foreground AER traffic preempts/pauses a background sweep and
-        // the sweep resumes rather than restarting from neuron 0.
-        //
-        // V_M[0] is prepared to 64.  Once the sweep decays it to 56, an event
-        // for source 10 is asserted and held until ACK.  If the sweep resumes
-        // from the next neuron, V_M[0] must remain 56 for the rest of that sweep;
-        // if it incorrectly restarts at zero, V_M[0] would decay again to 49.
-        // --------------------------------------------------------------------
-        $display("\n--- TEST 8: BACKGROUND SWEEP PREEMPTION / RESUME ---");
-
-        @(negedge CLK);
-        RST_N = 1'b0;
-        wait_clks(2);
-        @(negedge CLK);
-        RST_N = 1'b1;
-        @(posedge CLK);
-        #1;
-
-        set_weight(4'd0, 8'sd32);
-        send_event(4'd0, "PREEMPT-PREP-H0");
-        wait_hidden_only();
-        check(dut.V_M[0] === 12'sd64,
-              "preemption test prepares neuron 0 to raw 64");
-
-        set_weight(4'd10, 8'sd32);
-        send_event(4'd10, "PREEMPT-PREP-H10");
-        wait_hidden_only();
-        check(dut.V_M[10] === 12'sd64,
-              "preemption test prepares neuron 10 to raw 64");
-
-        // Wait until the periodic sweep has definitely processed neuron 0.
-        wait_for_membrane_value(0, 12'sd56,
-                                TB_LEAK_SWEEP_PERIOD_CYCLES + 40,
-                                "PREEMPT-SWEEP-START");
-
-        // Assert a foreground event immediately after observing neuron 0's leak
-        // write.  The DUT may finish the current background bookkeeping first,
-        // but it must eventually ACK this request and service it.
-        send_event_wait_for_ack(4'd10, "PREEMPT-EVENT", 20);
-        wait_hidden_only();
-
-        // Normal event update on neuron 10:
-        //   64 * .875 + 64 = 120.
-        // When the paused sweep later reaches neuron 10:
-        //   120 * .875 = 105.
-        wait_for_membrane_value(10, 12'sd105, 140,
-                                "PREEMPT-RESUME-H10");
-
-        check(dut.V_M[0] === 12'sd56,
-              "resumed sweep does not restart and leak neuron 0 a second time");
-        check(AER_OUT_REQ === 1'b0,
-              "preempting subthreshold event produces no external AER output");
-
-        // --------------------------------------------------------------------
-        // TEST 9: reset during/after background scheduling clears membrane state
-        // and cancels any pending sweep work.  No stale background write may
-        // restore an old membrane value after reset is released.
-        // --------------------------------------------------------------------
-        $display("\n--- TEST 9: RESET CANCELS BACKGROUND LEAK STATE ---");
-
-        @(negedge CLK);
-        RST_N = 1'b0;
-        wait_clks(2);
-        @(negedge CLK);
-        RST_N = 1'b1;
-        @(posedge CLK);
-        #1;
-
-        set_weight(4'd2, 8'sd32);
-        send_event(4'd2, "RESET-LEAK-PREP");
-        wait_hidden_only();
-        check(dut.V_M[2] === 12'sd64,
-              "reset/leak test prepares neuron 2 to nonzero state");
-
-        // Wait almost one period so a background request is near, then reset.
-        wait_clks(TB_LEAK_SWEEP_PERIOD_CYCLES - 20);
-        @(negedge CLK);
-        RST_N = 1'b0;
-        wait_clks(2);
-        @(negedge CLK);
-        RST_N = 1'b1;
-        @(posedge CLK);
-        #1;
-
-        for (n = 0; n < 32; n++)
-            check(dut.V_M[n] === 12'sd0,
-                  $sformatf("reset clears neuron %0d while leak scheduler is active/pending", n));
-
-        // Wait less than a fresh full period.  A stale pre-reset leak request
-        // must not execute after reset release.
-        wait_clks(100);
-        check(dut.V_M[2] === 12'sd0,
-              "no stale background write occurs after reset");
-        check(AER_OUT_REQ === 1'b0 &&
-              STDP_PRE_SPIKE === 16'h0000 &&
-              STDP_POST_SPIKE === 16'h0000,
-              "background scheduler remains externally quiet after reset");
 
         // --------------------------------------------------------------------
         // Summary
